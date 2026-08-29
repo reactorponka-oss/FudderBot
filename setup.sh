@@ -3,6 +3,7 @@ apt-get update
 apt-get install -y --no-install-recommends \
     apktool \
     openjdk-17-jdk \
+    aapt \
     wget \
     unzip
 
@@ -19,4 +20,4 @@ if [ ! -f "debug.keystore" ]; then
         -keypass android
 fi
 
-echo "Setup complete!"
+echo "✅ Setup complete!"
