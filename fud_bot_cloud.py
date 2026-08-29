@@ -1,4 +1,3 @@
-# fud_bot_ultimate.py
 import os
 import re
 import random
