@@ -1,6 +1,4 @@
 #!/bin/bash
-# setup.sh - Install system dependencies
-
 apt-get update
 apt-get install -y --no-install-recommends \
     apktool \
@@ -8,7 +6,7 @@ apt-get install -y --no-install-recommends \
     wget \
     unzip
 
-# Create debug keystore if not exists
+# Create debug keystore
 if [ ! -f "debug.keystore" ]; then
     keytool -genkey -v \
         -keystore debug.keystore \
